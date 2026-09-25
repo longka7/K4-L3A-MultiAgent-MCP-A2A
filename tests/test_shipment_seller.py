@@ -112,7 +112,12 @@ def test_summary_event_actor_resolves_conflicting_shipping_limits(tmp_path: Path
                 {"seller_id": "seller_3", "shipping_limit_at": "2018-03-12T09:00:00-03:00"},
             ],
             "events": [
-                {"event_type": "delivered_late", "actor": "seller", "status": "confirmed"}
+                {
+                    "event_at": "2018-03-05T09:00:00-03:00",
+                    "event_type": "delivered_late",
+                    "actor": "seller",
+                    "status": "confirmed",
+                }
             ],
         },
         prior,
@@ -122,3 +127,25 @@ def test_summary_event_actor_resolves_conflicting_shipping_limits(tmp_path: Path
     assert result.strongest_issue() == "late_delivery_seller"
     assert result.details_for("late_delivery_seller").refund_lines[0]["amount_brl"] == 18.0
     assert [name for name, _ in gateway.calls] == ["get_shipment_summary"]
+
+
+def test_late_event_after_early_delivery_is_ignored(tmp_path: Path) -> None:
+    ctx, _ = make_context(
+        tmp_path,
+        {
+            "delivered_carrier_at": "2017-12-31T09:00:00-03:00",
+            "delivered_customer_at": "2018-01-07T09:00:00-03:00",
+            "estimated_delivery_at": "2018-01-08T09:00:00-03:00",
+            "events": [
+                {
+                    "event_at": "2018-05-17T09:00:00-03:00",
+                    "event_type": "delivered_late",
+                    "actor": "logistics_provider",
+                    "status": "confirmed",
+                }
+            ],
+        },
+    )
+    result = asyncio.run(ShipmentSellerAgent().run(ctx))
+
+    assert "late_delivery_logistics" not in result.issue_signals

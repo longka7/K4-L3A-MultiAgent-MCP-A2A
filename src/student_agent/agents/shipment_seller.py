@@ -10,7 +10,7 @@ phần của issue thắng. party_id của seller phải lấy từ evidence, kh
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .contract import CaseContext, IssueDetail, SpecialistResult, ToolFailure
@@ -37,6 +37,17 @@ def _later(actual: Any, expected: Any) -> bool:
         actual_dt = datetime.fromisoformat(str(actual).replace("Z", "+00:00"))
         expected_dt = datetime.fromisoformat(str(expected).replace("Z", "+00:00"))
         return actual_dt > expected_dt
+    except (TypeError, ValueError):
+        return False
+
+
+def _near_delivery(event_at: Any, delivered_at: Any) -> bool:
+    if not event_at or not delivered_at:
+        return False
+    try:
+        event_time = datetime.fromisoformat(str(event_at).replace("Z", "+00:00"))
+        delivered_time = datetime.fromisoformat(str(delivered_at).replace("Z", "+00:00"))
+        return abs(event_time - delivered_time) <= timedelta(days=1)
     except (TypeError, ValueError):
         return False
 
@@ -170,6 +181,8 @@ class ShipmentSellerAgent:
                     if isinstance(event, dict)
                     and event.get("event_type") == "delivered_late"
                     and event.get("status") == "confirmed"
+                    and _later(delivered_date, estimated_date)
+                    and _near_delivery(event.get("event_at"), delivered_date)
                     and (
                         event.get("order_id") is None
                         or str(event["order_id"]) == str(order_id)
