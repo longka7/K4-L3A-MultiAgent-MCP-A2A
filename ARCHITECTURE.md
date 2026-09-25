@@ -18,7 +18,7 @@ Input → Coordinator → Specialists → Verifier → Output
 | --- | --- | --- | --- |
 | Coordinator | TODO | TODO | TODO |
 | Order/item | TODO | TODO | TODO |
-| Payment | TODO | TODO | TODO |
+| Payment | `ctx.claimed_order_id`, `ctx.prior["order-item-agent"]` | Gọi MCP `get_order_payments`, `get_payment_timeline`, `get_refund_timeline`; phát hiện trùng lặp giao dịch, lệch tiền, split payment, hoàn tiền thất bại/treo; trích xuất `payment_references` và tính toán `refund_lines` (BRL). | `SpecialistResult` chứa `payment_references`, `issue_signals`, `refund_lines`, `evidence_refs`, `root_causes`, `responsible_parties`. |
 | Shipment | TODO | TODO | TODO |
 | Policy | TODO | TODO | TODO |
 | Verifier | TODO | TODO | TODO |
