@@ -1,3 +1,15 @@
+
+"""Người 3 — Shipment · Seller agent.
+
+Tools: get_shipment_summary, get_sellers.
+Phân biệt: late_delivery_seller vs late_delivery_logistics. Điền responsible_parties,
+entities seller_ids/shipment_ids.
+
+Kết luận theo issue đặt trong `issue_details[issue] = IssueDetail(...)`: coordinator chỉ giữ
+phần của issue thắng. party_id của seller phải lấy từ evidence, không dùng id mẫu của policy.
+"""
+
+
 from __future__ import annotations
 
 from datetime import datetime
