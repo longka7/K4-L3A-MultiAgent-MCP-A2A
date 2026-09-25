@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from student_agent.agents.contract import CaseContext, ScopedGateway, ToolFailure
+from student_agent.agents.contract import CaseContext, ScopedGateway
 from student_agent.agents.order_item import OrderItemAgent
 from student_agent.contracts import Contracts
 from student_agent.trace import TraceWriter
@@ -240,9 +240,17 @@ def test_order_item_with_real_input_case_001(tmp_path: Path) -> None:
     res = asyncio.run(agent.run(ctx))
     assert res.agent == "order-agent"
     assert res.entities["order_ids"] == ["e2a03ccf5ea816036608b2d8c3ab8e60"]
-    assert any(call[0] == "get_order" and call[1]["order_id"] == "e2a03ccf5ea816036608b2d8c3ab8e60" for call in mock_gw.calls)
-    assert any(call[0] == "get_order_items" and call[1]["order_id"] == "e2a03ccf5ea816036608b2d8c3ab8e60" for call in mock_gw.calls)
-    # Claims from real case L3A_CASE_001: claim-001-a (canceled_order_paid), claim-001-b (requested_full_refund)
+    assert any(
+        call[0] == "get_order"
+        and call[1]["order_id"] == "e2a03ccf5ea816036608b2d8c3ab8e60"
+        for call in mock_gw.calls
+    )
+    assert any(
+        call[0] == "get_order_items"
+        and call[1]["order_id"] == "e2a03ccf5ea816036608b2d8c3ab8e60"
+        for call in mock_gw.calls
+    )
+    # Claims from case 001: canceled order and a requested full refund.
     claim_ids = [c["claim_id"] for c in res.claims]
     assert "claim-001-a" in claim_ids
     assert "claim-001-b" in claim_ids

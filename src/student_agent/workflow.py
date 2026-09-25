@@ -357,6 +357,11 @@ async def run_case(
         issues += verifier(output, CaseContext(case, scoped("verifier", ()), trace, results))
     except Exception:
         issues.append("verifier_error")
+    try:
+        trace.contracts.validate_output(output, f"outputs/{case_id}.json")
+    except ContractError:
+        output = _safe_output(case_id, ledger)
+        issues.append("schema_fallback_after_verification")
     trace.emit(
         case_id=case_id,
         event_type="verification_completed",

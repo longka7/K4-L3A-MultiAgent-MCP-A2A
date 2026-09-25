@@ -4,9 +4,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-import pytest
-
-from student_agent.agents.contract import CaseContext, ScopedGateway
+from student_agent.agents.contract import CaseContext, ScopedGateway, SpecialistResult
 from student_agent.agents.payment_refund import PaymentRefundAgent
 from student_agent.contracts import Contracts
 from student_agent.trace import TraceWriter
@@ -168,3 +166,15 @@ def test_payment_agent_refund_failed(tmp_path: Path) -> None:
     assert "refund_failed" in result.issue_signals
     assert result.issue_signals["refund_failed"] > 0.8
     assert "retry_refund" in result.actions
+
+
+def test_missing_payment_evidence_does_not_become_payment_mismatch(tmp_path: Path) -> None:
+    case = {"case_id": "CASE_MISSING_PAY", "customer_request": {"claimed_order_id": "ord_1"}}
+    ctx = make_context(tmp_path, case, {})
+    ctx.prior["order-agent"] = SpecialistResult(
+        agent="order-agent",
+        entities={"order_ids": ["ord_1"]},
+        notes={"items_total_brl": 100.0},
+    )
+    result = asyncio.run(PaymentRefundAgent().run(ctx))
+    assert "payment_mismatch" not in result.issue_signals

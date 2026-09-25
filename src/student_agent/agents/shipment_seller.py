@@ -1,4 +1,3 @@
-
 """Người 3 — Shipment · Seller agent.
 
 Tools: get_shipment_summary, get_sellers.
@@ -9,13 +8,42 @@ Kết luận theo issue đặt trong `issue_details[issue] = IssueDetail(...)`: 
 phần của issue thắng. party_id của seller phải lấy từ evidence, không dùng id mẫu của policy.
 """
 
-
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
-from .contract import CaseContext, SpecialistResult
+from .contract import CaseContext, IssueDetail, SpecialistResult, ToolFailure
+
+
+def _records(data: Any, plural: str, singular: str) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if not isinstance(data, dict):
+        return []
+    for key in (plural, singular, "items", "results"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            return [value]
+    return [data]
+
+
+def _later(actual: Any, expected: Any) -> bool:
+    if not actual or not expected:
+        return False
+    try:
+        actual_dt = datetime.fromisoformat(str(actual).replace("Z", "+00:00"))
+        expected_dt = datetime.fromisoformat(str(expected).replace("Z", "+00:00"))
+        return actual_dt > expected_dt
+    except (TypeError, ValueError):
+        return False
+
+
+def _first(record: dict[str, Any], *keys: str) -> Any:
+    return next((record[key] for key in keys if record.get(key) is not None), None)
+
 
 class ShipmentSellerAgent:
     name = "shipment-seller-agent"
@@ -23,298 +51,148 @@ class ShipmentSellerAgent:
 
     async def run(self, ctx: CaseContext) -> SpecialistResult:
         result = SpecialistResult(agent=self.name)
+        order_id = ctx.claimed_order_id
 
-        shipment_evidence = await ctx.gateway.call("get_shipment_summary")
-        seller_evidence = await ctx.gateway.call("get_sellers")
+        prior_order = ctx.prior.get("order-item-agent") or ctx.prior.get("order-agent")
+        if prior_order and prior_order.entities.get("order_ids"):
+            order_id = prior_order.entities["order_ids"][0]
 
-        shipment_ref = shipment_evidence["evidence_ref"]
-        seller_ref = seller_evidence["evidence_ref"]
+        if not order_id:
+            return result
 
-        result.evidence_refs.extend([shipment_ref, seller_ref])
+        # 1. Gọi get_shipment_summary
+        shipment_data: Any = {}
+        try:
+            shipment_ev = await ctx.gateway.call("get_shipment_summary", order_id=order_id)
+            result.evidence_refs.append(shipment_ev["evidence_ref"])
+            shipment_data = shipment_ev.get("data", {})
+        except (ToolFailure, Exception):
+            pass
 
-        shipments = self._records(shipment_evidence)
-        sellers = self._records(seller_evidence)
+        shipments = _records(shipment_data, "shipments", "shipment")
+        shipment_ids = [
+            str(value)
+            for shipment in shipments
+            if (value := _first(shipment, "shipment_id", "tracking_number", "package_id"))
+        ]
+        if shipment_ids:
+            result.entities["shipment_ids"] = list(dict.fromkeys(shipment_ids))[:20]
 
-        # The gateway evidence is the source of truth for entity IDs.
-        result.entities["shipment_ids"] = self._collect_ids(
-            shipments,
-            "shipment_id",
+        # 2. Xác định seller_id từ prior hoặc gọi get_sellers
+        prior_sellers = prior_order.entities.get("seller_ids", []) if prior_order else []
+        seller_ids = list(prior_sellers)
+        seller_ids.extend(
+            str(shipment["seller_id"])
+            for shipment in shipments
+            if shipment.get("seller_id") is not None
         )
-        result.entities["seller_ids"] = self._collect_ids(
-            sellers,
-            "seller_id",
-        )
 
-        # Some shipment responses may carry seller_id even when the seller
-        # response has a different/wrapped shape.
-        shipment_seller_ids = self._collect_ids(
-            shipments,
-            "seller_id",
-        )
-        result.entities["seller_ids"] = self._unique(
-            result.entities["seller_ids"] + shipment_seller_ids
-        )
-
-        for shipment in shipments:
-            issue = self._classify_delay(shipment)
-            if issue is None:
-                continue
-
-            result.issue_signals[issue] = max(
-                result.issue_signals.get(issue, 0.0),
-                self._signal_strength(shipment),
-            )
-
-            shipment_id = shipment.get("shipment_id")
-            seller_id = shipment.get("seller_id")
-
-            evidence_refs = [shipment_ref]
-
-            # If the shipment explicitly references a seller, use that seller
-            # as the responsible party only for seller-side delay.
-            if issue == "late_delivery_seller":
-                result.responsible_parties.append(
-                    {
-                        "party_type": "seller",
-                        "party_id": (
-                            str(seller_id)
-                            if seller_id is not None
-                            else None
-                        ),
-                    }
+        if not seller_ids:
+            try:
+                seller_ev = await ctx.gateway.call("get_sellers", order_id=order_id)
+                result.evidence_refs.append(seller_ev["evidence_ref"])
+                sellers = _records(seller_ev.get("data"), "sellers", "seller")
+                seller_ids.extend(
+                    str(seller["seller_id"])
+                    for seller in sellers
+                    if seller.get("seller_id") is not None
                 )
-                result.root_causes.append("SELLER_HANDOFF_LATE")
+            except (ToolFailure, Exception):
+                pass
 
-            elif issue == "late_delivery_logistics":
-                logistics_id = self._first(
+        if seller_ids:
+            result.entities["seller_ids"] = list(dict.fromkeys(seller_ids))[:20]
+
+        # Explicit attribution wins over a timeline inference. A late delivery
+        # alone cannot establish which party caused the delay.
+        for shipment in shipments:
+            limit_date = _first(
+                shipment, "shipping_limit_date", "seller_shipping_limit_date", "limit_date"
+            )
+            pickup_date = _first(
+                shipment, "carrier_pickup_date", "order_delivered_carrier_date", "pickup_date"
+            )
+            delivered_date = _first(
+                shipment,
+                "delivered_customer_date",
+                "order_delivered_customer_date",
+                "actual_delivery_date",
+                "delivered_date",
+            )
+            estimated_date = _first(
+                shipment,
+                "estimated_delivery_date",
+                "order_estimated_delivery_date",
+                "estimated_date",
+            )
+            attribution = " ".join(
+                str(shipment.get(key, "")).lower()
+                for key in ("delay_cause", "responsible_party", "delay_responsibility")
+            )
+            handoff_late = shipment.get("handoff_late") is True or _later(pickup_date, limit_date)
+            delivery_late = shipment.get("delivery_late") is True or _later(
+                delivered_date, estimated_date
+            )
+            explicit_seller = shipment.get("seller_at_fault") is True or any(
+                term in attribution for term in ("seller", "merchant")
+            )
+            explicit_logistics = shipment.get("logistics_at_fault") is True or any(
+                term in attribution for term in ("logistics", "carrier", "shipping_provider")
+            )
+            logistics_timeline = delivery_late and (
+                shipment.get("handoff_late") is False
+                or (pickup_date and limit_date and not handoff_late)
+            )
+            if explicit_seller and explicit_logistics:
+                continue
+            if explicit_seller or (not explicit_logistics and handoff_late):
+                issue, cause, party_type = "late_delivery_seller", "SELLER_HANDOFF_LATE", "seller"
+                party_id = shipment.get("seller_id") or (seller_ids[0] if seller_ids else None)
+            elif explicit_logistics or logistics_timeline:
+                issue = "late_delivery_logistics"
+                cause, party_type = "LOGISTICS_TRANSIT_DELAY", "logistics_provider"
+                party_id = _first(
                     shipment,
                     "logistics_provider_id",
                     "carrier_id",
                     "shipping_provider_id",
+                    "carrier_name",
+                    "carrier",
                 )
-
-                result.responsible_parties.append(
-                    {
-                        "party_type": "logistics_provider",
-                        "party_id": (
-                            str(logistics_id)
-                            if logistics_id is not None
-                            else None
-                        ),
-                    }
-                )
-                result.root_causes.append("LOGISTICS_DELIVERY_LATE")
-
-            claim_id = (
-                f"{issue}:{shipment_id}"
-                if shipment_id is not None
-                else issue
-            )
-
-            result.claims.append(
-                {
-                    "claim_id": claim_id,
-                    "verdict": issue,
-                    "confidence": self._signal_strength(shipment),
-                    "evidence_refs": evidence_refs,
-                }
-            )
-
-        result.evidence_refs = self._unique(result.evidence_refs)
-        result.root_causes = self._unique(result.root_causes)
-        result.responsible_parties = self._unique_dicts(
-            result.responsible_parties
-        )
-
-        result.notes["shipment_count"] = len(shipments)
-        result.notes["seller_count"] = len(sellers)
-
-        return result
-
-    @staticmethod
-    def _classify_delay(shipment: dict[str, Any]) -> str | None:
-        """
-        Distinguish seller delay from logistics delay using only fields
-        present in MCP evidence.
-
-        Explicit attribution takes precedence over timeline inference.
-        """
-
-        # Explicit attribution supplied by the gateway.
-        cause = shipment.get("delay_cause")
-        responsibility = shipment.get("responsible_party")
-        delay_responsibility = shipment.get("delay_responsibility")
-
-        explicit = " ".join(
-            str(value).lower()
-            for value in (
-                cause,
-                responsibility,
-                delay_responsibility,
-            )
-            if value is not None
-        )
-
-        if shipment.get("seller_at_fault") is True:
-            return "late_delivery_seller"
-
-        if shipment.get("logistics_at_fault") is True:
-            return "late_delivery_logistics"
-
-        if "seller" in explicit or "merchant" in explicit:
-            return "late_delivery_seller"
-
-        if (
-            "logistics" in explicit
-            or "carrier" in explicit
-            or "shipping_provider" in explicit
-        ):
-            return "late_delivery_logistics"
-
-        # Explicit boolean timeline facts.
-        if shipment.get("handoff_late") is True:
-            return "late_delivery_seller"
-
-        if (
-            shipment.get("delivery_late") is True
-            and shipment.get("handoff_late") is False
-        ):
-            return "late_delivery_logistics"
-
-        return None
-
-    @staticmethod
-    def _signal_strength(shipment: dict[str, Any]) -> float:
-        if (
-            shipment.get("seller_at_fault") is True
-            or shipment.get("logistics_at_fault") is True
-            or shipment.get("delay_cause") is not None
-            or shipment.get("responsible_party") is not None
-            or shipment.get("delay_responsibility") is not None
-        ):
-            return 0.9
-
-        if (
-            shipment.get("handoff_late") is not None
-            or shipment.get("delivery_late") is not None
-        ):
-            return 0.75
-
-        return 0.5
-
-    @staticmethod
-    def _records(evidence: dict[str, Any]) -> list[dict[str, Any]]:
-        """
-        Extract records while keeping the agent tolerant of common gateway
-        wrapper shapes.
-        """
-        for key in (
-            "shipments",
-            "shipment",
-            "sellers",
-            "seller",
-            "items",
-            "results",
-            "data",
-        ):
-            value = evidence.get(key)
-
-            if isinstance(value, list):
-                return [
-                    item for item in value
-                    if isinstance(item, dict)
-                ]
-
-            if isinstance(value, dict):
-                return [value]
-
-        # The evidence itself may represent one record.
-        if any(
-            key in evidence
-            for key in (
-                "shipment_id",
-                "seller_id",
-                "delay_cause",
-                "delivery_late",
-            )
-        ):
-            return [evidence]
-
-        return []
-
-    @staticmethod
-    def _collect_ids(
-        records: list[dict[str, Any]],
-        key: str,
-    ) -> list[str]:
-        result: list[str] = []
-
-        for record in records:
-            value = record.get(key)
-            if value is None:
+            else:
                 continue
 
-            value = str(value)
-            if value not in result:
-                result.append(value)
-
-        return result
-
-    @staticmethod
-    def _first(
-        record: dict[str, Any],
-        *keys: str,
-    ) -> Any:
-        for key in keys:
-            value = record.get(key)
-            if value is not None:
-                return value
-        return None
-
-    @staticmethod
-    def _unique(items: list[Any]) -> list[Any]:
-        result: list[Any] = []
-        seen: set[str] = set()
-
-        for item in items:
-            marker = repr(item)
-            if marker not in seen:
-                seen.add(marker)
-                result.append(item)
-
-        return result
-
-    @staticmethod
-    def _unique_dicts(
-        items: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        seen: set[tuple[Any, Any]] = set()
-
-        for item in items:
-            key = (
-                item.get("party_type"),
-                item.get("party_id"),
+            explicit = explicit_seller or explicit_logistics
+            result.issue_signals[issue] = max(
+                result.issue_signals.get(issue, 0.0), 0.9 if explicit else 0.85
             )
+            try:
+                freight = float(shipment.get("freight_value") or 0)
+            except (TypeError, ValueError):
+                freight = 0.0
+            refund_lines = []
+            if freight > 0:
+                refund_lines.append(
+                    {
+                        "reason_code": (
+                            "SELLER_LATE_DELIVERY"
+                            if issue == "late_delivery_seller"
+                            else "LOGISTICS_LATE_DELIVERY"
+                        ),
+                        "amount_brl": round(freight, 2),
+                        "entity_id": order_id,
+                    }
+                )
+            detail = result.issue_details.setdefault(issue, IssueDetail())
+            detail.root_causes.append(cause)
+            detail.responsible_parties.append(
+                {
+                    "party_type": party_type,
+                    "party_id": str(party_id) if party_id is not None else None,
+                }
+            )
+            detail.refund_lines.extend(refund_lines)
+            detail.actions.append("refund_freight")
 
-            if key not in seen:
-                seen.add(key)
-                result.append(item)
-
+        result.notes["shipment_count"] = len(shipments)
         return result
-
-
-def _after(actual: Any, expected: Any) -> bool:
-    """
-    Compare ISO timestamps without inventing a timezone.
-
-    Invalid/unparseable timestamps are treated as unavailable evidence.
-    """
-    try:
-        actual_dt = datetime.fromisoformat(str(actual).replace("Z", "+00:00"))
-        expected_dt = datetime.fromisoformat(
-            str(expected).replace("Z", "+00:00")
-        )
-        return actual_dt > expected_dt
-    except (TypeError, ValueError):
-        return False

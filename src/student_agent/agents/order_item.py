@@ -10,9 +10,10 @@ phần của issue thắng. Vocabulary chuẩn: xem docstring của policy_verif
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import suppress
 from typing import Any
 
-from .contract import CaseContext, ScopedGateway, SpecialistResult, ToolFailure
+from .contract import CaseContext, IssueDetail, ScopedGateway, SpecialistResult, ToolFailure
 
 
 def _unique_strings(items: Iterable[Any]) -> list[str]:
@@ -145,14 +146,10 @@ class OrderItemAgent:
             if "seller_id" in it and it["seller_id"]:
                 seller_ids.append(str(it["seller_id"]))
 
-            try:
+            with suppress(ValueError, TypeError):
                 total_items_price += float(it.get("price", 0.0))
-            except (ValueError, TypeError):
-                pass
-            try:
+            with suppress(ValueError, TypeError):
                 total_freight_value += float(it.get("freight_value", 0.0))
-            except (ValueError, TypeError):
-                pass
 
         # 4. Truy vấn context sản phẩm nếu có claimed_product_id
         claimed_pid = (
@@ -181,6 +178,7 @@ class OrderItemAgent:
         actions: list[str] = []
         conflicts: list[dict[str, Any]] = []
         claims: list[dict[str, Any]] = []
+        issue_details: dict[str, IssueDetail] = {}
 
         total_order_amount = round(total_items_price + total_freight_value, 2)
 
@@ -197,6 +195,12 @@ class OrderItemAgent:
                     "amount_brl": total_order_amount,
                     "entity_id": order_id,
                 })
+            issue_details["canceled_order_paid"] = IssueDetail(
+                root_causes=list(root_causes),
+                responsible_parties=list(responsible_parties),
+                refund_lines=list(refund_lines),
+                actions=list(actions),
+            )
         elif order_status == "unavailable":
             issue_signals["unavailable_order_paid"] = 0.90
             root_causes.append("ORDER_ITEMS_UNAVAILABLE")
@@ -211,10 +215,19 @@ class OrderItemAgent:
                     "amount_brl": total_order_amount,
                     "entity_id": order_id,
                 })
+            issue_details["unavailable_order_paid"] = IssueDetail(
+                root_causes=list(root_causes),
+                responsible_parties=list(responsible_parties),
+                refund_lines=list(refund_lines),
+                actions=list(actions),
+            )
 
         # 7. Phát hiện xung đột dữ liệu giữa claim của khách hàng và MCP
         claimed_issue = ctx.case.get("customer_request", {}).get("claimed_issue")
-        if claimed_issue in ("canceled_order", "order_canceled") and order_status not in ("canceled", ""):
+        if claimed_issue in ("canceled_order", "order_canceled") and order_status not in (
+            "canceled",
+            "",
+        ):
             conflicts.append({
                 "field": "order_status",
                 "sources": ["customer_claim", "mcp_get_order"],
@@ -265,6 +278,7 @@ class OrderItemAgent:
             "order_status": order_status,
             "items_count": len(raw_items),
             "items_total_brl": total_order_amount,
+            "order_value": total_order_amount,
             "has_items": bool(raw_items),
             "seller_count": len(seller_ids),
             "is_canceled": order_status == "canceled",
@@ -283,5 +297,5 @@ class OrderItemAgent:
             conflicts=conflicts,
             actions=actions,
             notes=notes,
+            issue_details=issue_details,
         )
-

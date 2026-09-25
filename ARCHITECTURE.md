@@ -1,90 +1,79 @@
 # L3A Architecture Record
 
-Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
+Hệ thống Multi-Agent điều tra khiếu nại thương mại điện tử K4 L3A tuân thủ các Public Contracts, Scoring Policy và MCP Audit.
 
 ## 1. System overview
 
-Luồng chạy tuần tự trong một tiến trình, mỗi case độc lập (ledger, cache và trace theo `case_id`):
+Quy trình tuần tự theo từng case qua các specialist. `run_case()` tạo ledger và cache riêng cho mỗi case, gọi các agent theo thứ tự, chọn `primary_issue` từ `issue_signals`, áp dụng rule của Policy Agent, kiểm tra schema và gọi verifier trước khi trả output.
 
 ```text
-inputs/<case_id>.json
-  → case_received (day09 run)
-  → Coordinator ── task_assigned ──► Specialist 1..N (order-item, shipment-seller,
-  │                                   payment-refund, policy), lần lượt, mỗi agent chạy một lần
-  │        ◄── handoff(findings_ready) + SpecialistResult
-  → decide(): chọn primary_issue từ issue_signals mạnh nhất
-  → áp dụng get_policy (nếu có) → assemble() → validate schema
-  → policy_decided → handoff(verify_request) → Verifier → verification_completed
-  → outputs/<case_id>.json → case_finalized (day09 run)
+Input → Coordinator → Order/Item Agent → Shipment/Seller Agent → Payment/Refund Agent → Policy Agent → Verifier Agent → Output
+                             │                     │                     │                  │               │
+                             └─────────────────────┴─────── MCP ─────────┴──────────────────┘               │
+                                                                   │                                        │
+                                                                   └─────────────────── Trace ──────────────┘
 ```
-
-Mọi lời gọi MCP đi qua `ScopedGateway`, mọi sự kiện đi qua `TraceWriter`.
 
 ## 2. Agent ownership
 
-| Actor | Input | Trách nhiệm | Output/handoff |
-| --- | --- | --- | --- |
-| Coordinator | `case` (case_id, customer_request, policy_version), kết quả các specialist | Giao việc, chọn `primary_issue`, áp policy, ghép output đúng schema, phát trace vòng đời; không gọi tool MCP nào | `outputs/<case_id>.json`, trace, handoff sang verifier |
-| Order/item | TODO | TODO | TODO |
-| Payment | `ctx.claimed_order_id`, `ctx.prior["order-item-agent"]` | Gọi MCP `get_order_payments`, `get_payment_timeline`, `get_refund_timeline`; phát hiện trùng lặp giao dịch, lệch tiền, split payment, hoàn tiền thất bại/treo; trích xuất `payment_references` và tính toán `refund_lines` (BRL). | `SpecialistResult` chứa `payment_references`, `issue_signals`, `refund_lines`, `evidence_refs`, `root_causes`, `responsible_parties`. |
-| Shipment | TODO | TODO | TODO |
-| Policy | TODO | TODO | TODO |
-| Verifier | TODO | TODO | TODO |
-
-Nêu rõ actor nào được quyền gọi tool nào. Tránh cho mọi agent quyền truy vấn tất cả tool nếu không cần thiết.
+| Actor | Allowed Tools | Input | Trách nhiệm | Output / Handoff |
+| --- | --- | --- | --- | --- |
+| **Coordinator** | *(None directly)* | `case` từ `inputs/` | Tạo ledger/cache theo case, giao việc, chọn issue, áp policy, tổng hợp findings, kiểm tra schema, phát `task_assigned` và `handoff`. CLI phát `case_received` và `case_finalized`. | Chuyển giao `CaseContext` cho từng specialist agent. |
+| **Order/Item Agent** | `get_order`, `get_order_items`, `get_product_context` | `claimed_order_id`, `case_id` | Truy vấn chi tiết đơn hàng, danh mục mặt hàng, phát hiện đơn bị hủy (`canceled_order_paid`) hoặc hết hàng (`unavailable_order_paid`). Điền entities `order_ids`, `item_ids`, `seller_ids`. | `SpecialistResult` (issue_signals, entities, root_causes, actions). |
+| **Shipment/Seller Agent** | `get_shipment_summary`, `get_sellers` | `claimed_order_id`, `prior` sellers | Truy vấn hành trình vận chuyển, so sánh mốc cam kết vs thực tế để phân biệt trễ do người bán (`late_delivery_seller`) hay do đối tác vận chuyển (`late_delivery_logistics`). Điền entity `shipment_ids`. | `SpecialistResult` (responsible_parties, root_causes, actions). |
+| **Payment/Refund Agent** | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` | `claimed_order_id`, `order_status` | Đối soát dòng tiền: phát hiện trùng thanh toán (`duplicate_charge`), sai lệch tiền (`payment_mismatch`), chia tiền hợp lệ (`valid_split_payment`), lỗi hoàn tiền (`refund_failed`) hay đang xử lý (`refund_pending`). Tính `refund_lines`. | `SpecialistResult` (payment_references, refund_lines, actions). |
+| **Policy Agent** | `get_policy`, `get_customer_history` | `policy_version`, `customer_request.claims`, `prior` findings | Lấy rule qua MCP, đối chiếu khiếu nại với findings, đánh giá claim. Coordinator chọn `primary_issue` và phát `policy_decided` khi áp rule. | `SpecialistResult` (claim_assessments, policy_rules). |
+| **Verifier** | *(None directly)* | Draft `output`, `CaseContext` | Chuẩn hóa tổng tiền, trạng thái, hành động và bên chịu trách nhiệm; coordinator kiểm tra lại schema và phát `verification_completed`. | Output đã kiểm tra hoặc fallback an toàn. |
 
 ## 3. A2A protocol
 
-- **Envelope:** `SpecialistResult` (`agents/contract.py`), trao đổi bằng lời gọi hàm trong tiến trình.
-  Không có message bất đồng bộ nên không có vòng lặp: pipeline tuyến tính, mỗi agent chạy đúng một lần.
-- **Correlation:** `case_id` có trong mọi lệnh gọi tool (do `ScopedGateway` tự chèn) và mọi trace event.
-- **Handoff:** coordinator giao việc (`task_assigned`) rồi nhận kết quả (`handoff` với `findings_ready`
-  hoặc `specialist_failed`); agent chạy sau đọc kết quả agent trước qua `ctx.prior`. Cuối cùng
-  coordinator chuyển output cho verifier (`handoff` với `verify_request`).
-- **Timeout:** mỗi lời gọi MCP tối đa 30 giây; hết hạn thì retry theo failure policy bên dưới.
-- **Trace:** chỉ ghi sự kiện và mã quyết định quan sát được, không ghi prompt hay suy luận riêng.
+- **Message Envelope:** Các agent trao đổi thông qua `CaseContext`:
+  - `case`: Dữ liệu gốc của case (read-only).
+  - `gateway`: `ScopedGateway` chỉ cho phép gọi các tool được cấp quyền.
+  - `trace`: `TraceWriter` ghi nhận observable events.
+  - `prior`: Dict chứa `SpecialistResult` của tất cả các agent đã chạy trước đó trong cùng case.
+- **Correlation:** Tất cả tool calls và trace events đều được gán `case_id` tương ứng, ngăn chặn tuyệt đối rò rỉ dữ liệu chéo case.
+- **Handoff:** Coordinator phát event `task_assigned` khi giao việc và nhận lại `handoff` (`findings_ready` hoặc `specialist_failed`).
 
 ## 4. Evidence lifecycle
 
-1. Server trả evidence; `EvidenceGateway` validate theo `mcp-evidence-response-v1`.
-2. `ScopedGateway` ghi `evidence_ref` vào ledger của đúng case và phát `tool_result_consumed`
-   (một event cho mỗi cặp actor + evidence, kể cả khi trúng cache, để trace không phình).
-3. Agent đưa ref vào `SpecialistResult.evidence_refs` hoặc `claims`.
-4. `assemble()` chỉ giữ ref có trong ledger. Ref bịa hoặc ref của case khác không thể lọt vào output.
-5. Ledger và cache được tạo trong `run_case`, nên evidence không bao giờ dùng lại giữa các case.
+- **Validation:** Mọi phản hồi từ MCP Server đều được kiểm tra hợp lệ với `mcp-evidence-response-v1.schema.json`.
+- **Per-case Ledger:** `ScopedGateway` tự động ghi nhận từng `evidence_ref` được server trả về vào một `ledger` riêng của case đó.
+- **Provenance Gate:** Hàm `assemble()` chỉ cho phép các `evidence_refs` tồn tại trong `ledger` được đưa vào output cuối cùng. Tuyệt đối không sinh mã giả.
+- **Trace Consumption:** Ngay khi tool trả về kết quả, `ScopedGateway` tự động phát sự kiện trace `tool_result_consumed` với `actor`, `tool_name` và `evidence_refs`.
+- **Tool efficiency:** Cache theo case và bộ tham số dùng chung giữa các agent. Shipment chỉ gọi `get_sellers` khi chưa có seller ID từ order hoặc shipment. Mỗi agent chỉ được gọi các tool khai báo trong `tools`.
 
 ## 5. Failure policy
 
-| Failure | Retry? | Fallback | Trace event/code |
+| Failure | Retry? | Fallback | Trace event / code |
 | --- | --- | --- | --- |
-| MCP timeout | Có: tối đa 2 lần, chờ 0,5 s rồi 1 s (các tool đều chỉ đọc nên an toàn khi gọi lại) | `ToolFailure(kind=timeout)`; agent quyết định, nếu agent lỗi thì coordinator bỏ qua agent đó và đi tiếp | `handoff` / `specialist_failed` + `error_type` |
-| Not found | Không (server báo lỗi rõ ràng) | `ToolFailure(kind=tool_error)`; agent không phát tín hiệu → có thể ra `insufficient_evidence`, không đoán dữ liệu | `handoff` / `specialist_failed` hoặc note của agent |
-| Source conflict | TODO | TODO | TODO |
-| Invalid specialist result | Không | Output sai schema thì dùng output an toàn (`insufficient_evidence`, không claim, chỉ evidence từ MCP) thay vì làm hỏng cả lượt chạy | `verification_completed` / `issues_found` chứa `schema_fallback` |
-
-Retry phải có giới hạn và idempotent. Không chuyển missing evidence thành dữ liệu phỏng đoán.
+| **MCP timeout** | Có (tối đa 2 lần, exponential backoff: 0.5s, 1.0s) | Báo `ToolFailure("timeout")`, specialist bỏ qua tool và dùng dữ liệu tối thiểu. | `handoff` với `decision_code="specialist_failed"` |
+| **Transport error** | Có (tối đa 2 lần) | Báo `ToolFailure("transport")`. | `handoff` với `decision_code="specialist_failed"` |
+| **Tool error (Server)** | Không retry | Không đoán dữ liệu, ghi nhận lỗi. | `handoff` với `decision_code="specialist_failed"` |
+| **Source conflict** | Không retry | Ưu tiên dữ liệu MCP so với lời kể của khách; ghi `data_conflicts` với nguồn được chọn. | `tool_result_consumed`, `verification_completed` |
+| **Invalid specialist result** | Không | Coordinator dùng fallback an toàn `_safe_output()`. | `verification_completed` với `schema_fallback` |
 
 ## 6. Verification invariants
 
-Coordinator tự bảo đảm trong `assemble()`:
-- `case_id` của output bằng `case_id` của input; output khớp JSON Schema (nếu không thì dùng fallback).
-- Mọi `evidence_refs` (kể cả trong claim) đều nằm trong ledger MCP của đúng case.
-- Chỉ giữ hành động, bên chịu trách nhiệm, dòng hoàn tiền và root cause của issue thắng cuộc.
-- Khi có `get_policy`: `case_status`, `resolution_actions` và loại bên chịu trách nhiệm theo rule của issue;
-  refund bằng 0 theo policy thì bỏ `refund_lines`.
-- `recommended_refund_brl` bằng tổng `refund_lines`; `confidence` tối đa 0,2 khi không có evidence.
-- Mỗi claim trong input đều có một `claim_assessment`.
-
-Verifier bổ sung (Người 5): tổng tiền, status↔refund↔action, seller responsibility, xung đột dữ liệu.
-Cờ `no_evidence`, `refund_on_no_action`, `schema_fallback` được ghi vào `verification_completed`.
+Trước khi xuất file output, `Verifier Agent` kiểm tra và chuẩn hóa các quy tắc:
+1. **Financial Invariant:** Tổng `amount_brl` trong `refund_lines` phải khớp chính xác với `recommended_refund_brl`.
+2. **Status ↔ Refund Consistency:** Nếu `case_status == "no_action"`, thì `recommended_refund_brl` bắt buộc bằng `0.0` và `refund_lines` rỗng.
+3. **Action Consistency:**
+   - Nếu `recommended_refund_brl > 0`, `resolution_actions` bắt buộc phải có `"issue_refund"`.
+   - Nếu `case_status == "no_action"`, `resolution_actions` tuyệt đối không chứa bất kỳ hành động nào liên quan đến refund.
+4. **Responsibility Invariant:**
+   - Khi `late_delivery_seller`: trong `responsible_parties` phải có `party_type == "seller"`.
+   - Khi `late_delivery_logistics`: trong `responsible_parties` phải có `party_type == "logistics_provider"`.
+5. **Entity Scope:** Mọi entity IDs (`order_ids`, `item_ids`,...) phải có nguồn gốc từ dữ liệu thực tế quan sát được.
+6. **Confidence Calibration:** `decide()` kết hợp tín hiệu mạnh nhất với tỷ trọng của nó trong các tín hiệu cạnh tranh; giới hạn tối đa 0.95. Khi không có evidence, confidence tối đa 0.2. Đây là heuristic, chưa được hiệu chỉnh trên nhãn ẩn.
 
 ## 7. Reproducibility
 
-- Không dùng LLM và không có yếu tố ngẫu nhiên; hòa điểm giữa các issue được phá theo thứ tự cố định
-  của `ISSUE_CODES`, nên cùng dữ liệu luôn cho cùng output.
-- Chạy tuần tự (concurrency = 1), mỗi lời gọi MCP timeout 30 s, retry tối đa 2 lần.
-- Python >= 3.11, `mcp` 2.x (`mcp_gateway.py` đọc cả `is_error` và `isError`).
-- Lệnh: `python -m pip install -e ".[dev]"`, `day09 run`, `day09 validate`, `day09 package`.
-- Giới hạn: mỗi file trong ZIP tối đa 1 MB. Trace hiện khoảng 320 KB cho 100 case (agent rỗng); cần theo dõi
-  khi các agent gọi nhiều tool.
-- Không ghi API key vào repo, output hay trace.
+- **Môi trường:** Python >= 3.11, chạy trên Windows/Linux.
+- **Dependencies:** `httpx2>=2,<3`, `jsonschema[format]>=4.25,<5`, `mcp>=2,<3`, `python-dotenv>=1.1,<2`.
+- **Cơ chế ra quyết định:** Deterministic rule-based, đảm bảo kết quả 100% tái lập, thời gian thực thi nhanh và không phụ thuộc chi phí/độ trễ của API bên thứ ba.
+- **A2A và retry:** Mỗi agent chạy một lần theo thứ tự; MCP timeout 30 giây, thử lại tối đa 2 lần với chờ 0.5 và 1 giây cho lỗi tạm thời. Issue hòa điểm được phá theo thứ tự `ISSUE_CODES`.
+- **Lệnh thực thi:**
+  - Chạy toàn bộ 100 cases: `day09 run`
+  - Kiểm tra tính hợp lệ: `day09 validate`
+  - Đóng gói submission: `day09 package --output dist/submission.zip`
