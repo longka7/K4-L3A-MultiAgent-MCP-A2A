@@ -269,6 +269,45 @@ def test_output_evidence_is_scoped_to_winning_issue() -> None:
     assert output["evidence_refs"] == [REF_A]
 
 
+def test_claim_assessments_are_unique_by_claim_id() -> None:
+    order = SpecialistResult(
+        agent="order-item-agent",
+        issue_signals={"canceled_order_paid": 0.9},
+        evidence_refs=[REF_A],
+        claims=[
+            {
+                "claim_id": "c-a",
+                "verdict": "supported",
+                "confidence": 0.95,
+                "evidence_refs": [REF_A],
+            }
+        ],
+    )
+    policy = SpecialistResult(
+        agent="policy-agent",
+        evidence_refs=[REF_B],
+        claims=[
+            {
+                "claim_id": "c-a",
+                "verdict": "unsupported",
+                "confidence": 0.8,
+                "evidence_refs": [REF_B],
+            },
+            {
+                "claim_id": "c-b",
+                "verdict": "supported",
+                "confidence": 0.9,
+                "evidence_refs": [REF_A, REF_B],
+            },
+        ],
+    )
+
+    output = assemble(CASE_CLAIMS, [order, policy], LEDGER)
+
+    assert [claim["claim_id"] for claim in output["claim_assessments"]] == ["c-a", "c-b"]
+    assert output["claim_assessments"][0]["verdict"] == "supported"
+
+
 def test_losing_issue_details_do_not_leak_into_output() -> None:
     payment = SpecialistResult(
         agent="payment",

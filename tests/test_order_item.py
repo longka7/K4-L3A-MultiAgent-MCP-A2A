@@ -141,7 +141,7 @@ def test_order_item_canceled_order_flow(tmp_path: Path) -> None:
     assert REF_ORDER in res.evidence_refs
     assert REF_ITEMS in res.evidence_refs
     assert res.entities["order_ids"] == ["ORD_001"]
-    assert "PROD_ABC" in res.entities["item_ids"]
+    assert "PROD_ABC" not in res.entities["item_ids"]
     assert "1" in res.entities["item_ids"]
     assert "SELLER_XYZ" in res.entities["seller_ids"]
     assert "ORDER_CANCELED_BEFORE_FULFILLMENT" in res.root_causes

@@ -211,6 +211,7 @@ def assemble(
         for key in ENTITY_KEYS
     }
     claims = []
+    assessed_claim_ids: set[str] = set()
     claim_topics = {
         claim.get("claim_id"): claim.get("topic")
         for claim in case.get("customer_request", {}).get("claims", [])
@@ -218,7 +219,10 @@ def assemble(
     }
     for result in results:
         for claim in result.claims:
-            topic = claim_topics.get(claim.get("claim_id"))
+            claim_id = claim.get("claim_id")
+            if claim_id in assessed_claim_ids:
+                continue
+            topic = claim_topics.get(claim_id)
             claim_issue = topic if topic in ISSUE_EVIDENCE_TOOLS else issue
             claims.append(
                 {
@@ -226,6 +230,7 @@ def assemble(
                     "evidence_refs": real(claim.get("evidence_refs", []), claim_issue)[:30],
                 }
             )
+            assessed_claim_ids.add(claim_id)
     evidence = real([ref for r in results for ref in r.evidence_refs], issue)
     evidence = real(evidence + [ref for c in claims for ref in c["evidence_refs"]])[:30]
     if not evidence:

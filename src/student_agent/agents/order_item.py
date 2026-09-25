@@ -125,7 +125,6 @@ class OrderItemAgent:
                 raw_items = candidate
 
         item_ids: list[str] = []
-        product_ids: list[str] = []
         seller_ids: list[str] = []
         total_items_price = 0.0
         total_freight_value = 0.0
@@ -138,12 +137,6 @@ class OrderItemAgent:
                 item_ids.append(str(it["order_item_id"]))
             elif "item_id" in it:
                 item_ids.append(str(it["item_id"]))
-
-            if "product_id" in it and it["product_id"]:
-                pid = str(it["product_id"])
-                product_ids.append(pid)
-                if pid not in item_ids:
-                    item_ids.append(pid)
 
             if "seller_id" in it and it["seller_id"]:
                 seller_ids.append(str(it["seller_id"]))
