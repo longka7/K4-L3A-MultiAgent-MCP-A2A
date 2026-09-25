@@ -87,7 +87,9 @@ class PaymentRefundAgent:
         total_paid = 0.0
 
         for p in payment_list:
-            if isinstance(p, dict):
+            if isinstance(p, dict) and (
+                p.get("order_id") is None or str(p["order_id"]) == str(order_id)
+            ):
                 ref = (
                     p.get("payment_reference")
                     or p.get("payment_id")
@@ -113,6 +115,10 @@ class PaymentRefundAgent:
                 if isinstance(event, dict)
                 and event.get("event_type") == "captured"
                 and event.get("status") == "confirmed"
+                and (
+                    event.get("order_id") is None
+                    or str(event["order_id"]) == str(order_id)
+                )
                 and _within_window(event.get("event_at"), purchase_at, opened_at)
             ]
             payment_count = len(captures)
@@ -162,6 +168,10 @@ class PaymentRefundAgent:
                 for event in refund_events
                 if isinstance(event, dict)
                 and event.get("event_type") == "refund_requested"
+                and (
+                    event.get("order_id") is None
+                    or str(event["order_id"]) == str(order_id)
+                )
                 and _within_window(
                     event.get("event_at"),
                     prior_order.notes.get("order_purchase_at") if prior_order else None,

@@ -27,6 +27,35 @@ NO_ACTION_ISSUES = frozenset({"valid_split_payment", "unsupported_claim"})
 NEEDS_INVESTIGATION_ISSUES = frozenset({"insufficient_evidence", "refund_pending"})
 MIN_SIGNAL = 0.05
 NO_EVIDENCE_CONFIDENCE_CAP = 0.2
+ISSUE_EVIDENCE_TOOLS: dict[str, frozenset[str]] = {
+    "canceled_order_paid": frozenset(
+        {"get_order", "get_order_items", "get_order_payments", "get_policy"}
+    ),
+    "unavailable_order_paid": frozenset(
+        {"get_order", "get_order_items", "get_order_payments", "get_policy"}
+    ),
+    "late_delivery_seller": frozenset(
+        {"get_order", "get_order_items", "get_shipment_summary", "get_sellers", "get_policy"}
+    ),
+    "late_delivery_logistics": frozenset(
+        {"get_order", "get_shipment_summary", "get_sellers", "get_policy"}
+    ),
+    "valid_split_payment": frozenset(
+        {"get_order_items", "get_order_payments", "get_payment_timeline", "get_policy"}
+    ),
+    "payment_mismatch": frozenset(
+        {"get_order_items", "get_order_payments", "get_payment_timeline", "get_policy"}
+    ),
+    "duplicate_charge": frozenset(
+        {"get_order_items", "get_order_payments", "get_payment_timeline", "get_policy"}
+    ),
+    "refund_pending": frozenset(
+        {"get_order", "get_order_payments", "get_refund_timeline", "get_policy"}
+    ),
+    "refund_failed": frozenset(
+        {"get_order", "get_order_payments", "get_refund_timeline", "get_policy"}
+    ),
+}
 
 Verifier = Callable[[dict[str, Any], CaseContext], list[str]]
 
@@ -169,21 +198,36 @@ def assemble(
         status = rule["case_status"]
     detail = _merged_details(results, issue)
 
-    def real(refs: Sequence[str]) -> list[str]:
-        return [ref for ref in _unique(list(refs)) if ref in ledger]
+    def real(refs: Sequence[str], for_issue: str | None = None) -> list[str]:
+        allowed = ISSUE_EVIDENCE_TOOLS.get(for_issue or "")
+        return [
+            ref
+            for ref in _unique(list(refs))
+            if ref in ledger and (allowed is None or ledger[ref] in allowed)
+        ]
 
     entities = {
         key: sorted({str(v) for r in results for v in r.entities.get(key, [])})[:20]
         for key in ENTITY_KEYS
     }
     claims = []
+    claim_topics = {
+        claim.get("claim_id"): claim.get("topic")
+        for claim in case.get("customer_request", {}).get("claims", [])
+        if isinstance(claim, dict)
+    }
     for result in results:
         for claim in result.claims:
-            claims.append({**claim, "evidence_refs": real(claim.get("evidence_refs", []))[:30]})
-    evidence = real(
-        [ref for r in results for ref in r.evidence_refs]
-        + [ref for c in claims for ref in c["evidence_refs"]]
-    )[:30]
+            topic = claim_topics.get(claim.get("claim_id"))
+            claim_issue = topic if topic in ISSUE_EVIDENCE_TOOLS else issue
+            claims.append(
+                {
+                    **claim,
+                    "evidence_refs": real(claim.get("evidence_refs", []), claim_issue)[:30],
+                }
+            )
+    evidence = real([ref for r in results for ref in r.evidence_refs], issue)
+    evidence = real(evidence + [ref for c in claims for ref in c["evidence_refs"]])[:30]
     if not evidence:
         confidence = min(confidence, NO_EVIDENCE_CONFIDENCE_CAP)
     claims += _claim_fallbacks(

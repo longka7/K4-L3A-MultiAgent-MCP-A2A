@@ -170,6 +170,10 @@ class ShipmentSellerAgent:
                     if isinstance(event, dict)
                     and event.get("event_type") == "delivered_late"
                     and event.get("status") == "confirmed"
+                    and (
+                        event.get("order_id") is None
+                        or str(event["order_id"]) == str(order_id)
+                    )
                 }
                 explicit_seller |= "seller" in late_actors
                 explicit_logistics |= "logistics_provider" in late_actors

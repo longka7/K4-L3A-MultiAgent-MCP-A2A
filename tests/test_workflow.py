@@ -255,6 +255,20 @@ def test_refund_pending_defaults_to_needs_investigation() -> None:
     assert decide([result])[:2] == ("refund_pending", "needs_investigation")
 
 
+def test_output_evidence_is_scoped_to_winning_issue() -> None:
+    payment = SpecialistResult(
+        agent="payment",
+        issue_signals={"duplicate_charge": 0.9},
+        evidence_refs=[REF_A],
+    )
+    shipment = SpecialistResult(agent="shipment", evidence_refs=[REF_B])
+    ledger = {REF_A: "get_order_payments", REF_B: "get_shipment_summary"}
+
+    output = assemble(CASE, [payment, shipment], ledger)
+
+    assert output["evidence_refs"] == [REF_A]
+
+
 def test_losing_issue_details_do_not_leak_into_output() -> None:
     payment = SpecialistResult(
         agent="payment",
