@@ -47,11 +47,30 @@ TraceValue = str | int | float | bool | None
 
 
 @dataclass
+class IssueDetail:
+    """Conclusions that only make sense if ``primary_issue`` ends up being this issue."""
+
+    # cause codes, most likely first, e.g. "SELLER_HANDOFF_LATE" (^[A-Z][A-Z0-9_]{2,79}$)
+    root_causes: list[str] = field(default_factory=list)
+    # {"party_type": one of PARTY_TYPES, "party_id": str | None}
+    responsible_parties: list[dict[str, Any]] = field(default_factory=list)
+    # {"reason_code", "amount_brl", "entity_id"}
+    refund_lines: list[dict[str, Any]] = field(default_factory=list)
+    # action codes (<= 80 chars). When get_policy is available the coordinator uses
+    # the policy's recommended_action instead, so prefer that vocabulary.
+    actions: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SpecialistResult:
     """What a specialist hands back to the coordinator.
 
     Only put in what the agent actually observed through MCP. Leave a field empty
     instead of guessing.
+
+    The coordinator decides ``primary_issue`` from everyone's ``issue_signals`` and
+    then keeps ONLY the winning issue's details, so an agent that lost the vote can
+    never leak its actions, parties or refund lines into the final output.
     """
 
     agent: str
@@ -64,18 +83,42 @@ class SpecialistResult:
     # items shaped like the schema's claimAssessment:
     # {"claim_id", "verdict", "confidence", "evidence_refs"}
     claims: list[dict[str, Any]] = field(default_factory=list)
-    # cause codes, most likely first, e.g. "SELLER_HANDOFF_LATE" (^[A-Z][A-Z0-9_]{2,79}$)
-    root_causes: list[str] = field(default_factory=list)
-    # {"party_type": one of PARTY_TYPES, "party_id": str | None}
-    responsible_parties: list[dict[str, Any]] = field(default_factory=list)
-    # {"reason_code", "amount_brl", "entity_id"}
-    refund_lines: list[dict[str, Any]] = field(default_factory=list)
     # items shaped like the schema's dataConflict
     conflicts: list[dict[str, Any]] = field(default_factory=list)
-    # short action codes, e.g. "refund_customer" (<= 80 chars each)
-    actions: list[str] = field(default_factory=list)
     # small scalar facts for the trace (never prompts or reasoning)
     notes: dict[str, TraceValue] = field(default_factory=dict)
+    # Preferred: per-issue conclusions, e.g. {"duplicate_charge": IssueDetail(...)}.
+    issue_details: dict[str, IssueDetail] = field(default_factory=dict)
+    # Policy agent only: the ``rules`` dict from get_policy (issue -> case_status,
+    # recommended_action, refund_brl, responsible_parties). Add the get_policy
+    # evidence_ref to ``evidence_refs`` as usual.
+    policy_rules: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Legacy shortcut: these four flat fields are treated as the details of THIS
+    # agent's strongest signalled issue. Use ``issue_details`` when an agent can
+    # signal more than one issue.
+    root_causes: list[str] = field(default_factory=list)
+    responsible_parties: list[dict[str, Any]] = field(default_factory=list)
+    refund_lines: list[dict[str, Any]] = field(default_factory=list)
+    actions: list[str] = field(default_factory=list)
+
+    def strongest_issue(self) -> str | None:
+        signals = {c: s for c, s in self.issue_signals.items() if c in ISSUE_CODES and s > 0}
+        if not signals:
+            return None
+        return min(signals, key=lambda code: (-signals[code], ISSUE_CODES.index(code)))
+
+    def details_for(self, issue: str) -> IssueDetail:
+        if issue in self.issue_details:
+            return self.issue_details[issue]
+        flat = IssueDetail(
+            self.root_causes, self.responsible_parties, self.refund_lines, self.actions
+        )
+        has_flat = any(
+            (flat.root_causes, flat.responsible_parties, flat.refund_lines, flat.actions)
+        )
+        if has_flat and self.strongest_issue() == issue:
+            return flat
+        return IssueDetail()
 
 
 class ToolFailure(RuntimeError):
@@ -114,6 +157,7 @@ class ScopedGateway:
         self._timeout = timeout
         self._retries = retries
         self._backoff = backoff
+        self._emitted: set[str] = set()
 
     async def call(self, tool_name: str, **arguments: str) -> dict[str, Any]:
         if tool_name not in self.allowed_tools:
@@ -125,13 +169,15 @@ class ScopedGateway:
             self._cache[key] = evidence
         ref = evidence["evidence_ref"]
         self._ledger.setdefault(ref, tool_name)
-        self._trace.emit(
-            case_id=self.case_id,
-            event_type="tool_result_consumed",
-            actor=self.actor,
-            tool_name=tool_name,
-            evidence_refs=[ref],
-        )
+        if ref not in self._emitted:  # one trace event per actor per evidence keeps the trace small
+            self._emitted.add(ref)
+            self._trace.emit(
+                case_id=self.case_id,
+                event_type="tool_result_consumed",
+                actor=self.actor,
+                tool_name=tool_name,
+                evidence_refs=[ref],
+            )
         return evidence
 
     async def _fetch(self, tool_name: str, arguments: dict[str, str]) -> dict[str, Any]:

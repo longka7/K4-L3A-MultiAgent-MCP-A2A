@@ -2,6 +2,9 @@
 
 Tools: get_order, get_order_items, get_product_context.
 Nhận diện: canceled_order_paid, unavailable_order_paid. Điền entities order_ids/item_ids.
+
+Kết luận theo issue đặt trong `issue_details[issue] = IssueDetail(...)`: coordinator chỉ giữ
+phần của issue thắng. Vocabulary chuẩn: xem docstring của policy_verifier.py.
 """
 
 from __future__ import annotations

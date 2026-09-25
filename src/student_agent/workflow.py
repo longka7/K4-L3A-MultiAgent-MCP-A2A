@@ -11,6 +11,7 @@ from .agents.contract import (
     ISSUE_CODES,
     PARTY_TYPES,
     CaseContext,
+    IssueDetail,
     ScopedGateway,
     Specialist,
     SpecialistResult,
@@ -20,9 +21,12 @@ from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
 
 CAUSE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
-# Assumption to re-check against the public score: these two issues need no customer action.
+CASE_STATUSES = frozenset({"action_required", "no_action", "needs_investigation"})
+# Defaults used only when get_policy evidence is missing. EC_POLICY_V1 confirms both sets.
 NO_ACTION_ISSUES = frozenset({"valid_split_payment", "unsupported_claim"})
+NEEDS_INVESTIGATION_ISSUES = frozenset({"insufficient_evidence", "refund_pending"})
 MIN_SIGNAL = 0.05
+NO_EVIDENCE_CONFIDENCE_CAP = 0.2
 
 Verifier = Callable[[dict[str, Any], CaseContext], list[str]]
 
@@ -38,8 +42,16 @@ def _unique(items: Sequence[Any]) -> list[Any]:
     return result
 
 
+def default_status(issue: str) -> str:
+    if issue in NO_ACTION_ISSUES:
+        return "no_action"
+    if issue in NEEDS_INVESTIGATION_ISSUES:
+        return "needs_investigation"
+    return "action_required"
+
+
 def decide(results: Sequence[SpecialistResult]) -> tuple[str, str, float]:
-    """Pick primary_issue, case_status and confidence from specialist signals."""
+    """Pick primary_issue, a default case_status and confidence from specialist signals."""
     strongest: dict[str, float] = {}
     for result in results:
         for code, strength in result.issue_signals.items():
@@ -54,20 +66,108 @@ def decide(results: Sequence[SpecialistResult]) -> tuple[str, str, float]:
     share = top / sum(positive.values())
     # Placeholder calibration: blend absolute strength with margin over competing issues.
     confidence = round(min(max(0.5 * top + 0.5 * share, 0.05), 0.95), 3)
-    if top_code == "insufficient_evidence":
-        status = "needs_investigation"
-    elif top_code in NO_ACTION_ISSUES:
-        status = "no_action"
-    else:
-        status = "action_required"
-    return top_code, status, confidence
+    return top_code, default_status(top_code), confidence
+
+
+def policy_rule_for(results: Sequence[SpecialistResult], issue: str) -> dict[str, Any] | None:
+    """The get_policy rule for ``issue``, if the policy agent supplied one."""
+    for result in results:
+        rule = result.policy_rules.get(issue)
+        if isinstance(rule, dict):
+            return rule
+    return None
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _merged_details(results: Sequence[SpecialistResult], issue: str) -> IssueDetail:
+    merged = IssueDetail()
+    for result in results:
+        detail = result.details_for(issue)
+        merged.root_causes += detail.root_causes
+        merged.responsible_parties += detail.responsible_parties
+        merged.refund_lines += detail.refund_lines
+        merged.actions += detail.actions
+    return merged
+
+
+def _parties(candidates: Sequence[dict[str, Any]], rule: dict[str, Any] | None) -> list[dict]:
+    valid = [
+        {
+            "party_type": p["party_type"],
+            "party_id": None if p.get("party_id") is None else str(p["party_id"]),
+        }
+        for p in candidates
+        if p.get("party_type") in PARTY_TYPES
+    ]
+    if not rule:
+        return _unique(valid)
+    rule_types = _unique(
+        [
+            p["party_type"]
+            for p in rule.get("responsible_parties", [])
+            if isinstance(p, dict) and p.get("party_type") in PARTY_TYPES
+        ]
+    )
+    kept = [p for p in valid if p["party_type"] in rule_types]
+    if kept:
+        return _unique(kept)
+    # The policy's party_id is a fixed sample shared by every case, so only its type is trusted.
+    return [{"party_type": party_type, "party_id": None} for party_type in rule_types]
+
+
+def _claim_fallbacks(
+    case: dict[str, Any],
+    issue: str,
+    status: str,
+    confidence: float,
+    evidence: list[str],
+    assessed: set[str],
+) -> list[dict[str, Any]]:
+    """One assessment per input claim that no specialist assessed (derived, not invented)."""
+    claims = []
+    for claim in case.get("customer_request", {}).get("claims", []):
+        claim_id, topic = claim.get("claim_id"), claim.get("topic")
+        if not isinstance(claim_id, str) or claim_id in assessed:
+            continue
+        if topic == "requested_full_refund":
+            verdict = {"no_action": "unsupported", "needs_investigation": "insufficient_evidence"}
+            verdict = verdict.get(status, "partially_supported")
+        elif issue == "insufficient_evidence":
+            verdict = "insufficient_evidence"
+        elif topic == issue and topic != "unsupported_claim":
+            verdict = "supported"
+        else:
+            verdict = "unsupported"
+        claims.append(
+            {
+                "claim_id": claim_id[:64],
+                "verdict": verdict,
+                "confidence": confidence,
+                "evidence_refs": evidence[:30],
+            }
+        )
+    return claims
 
 
 def assemble(
-    case_id: str, results: Sequence[SpecialistResult], ledger: dict[str, str]
+    case: dict[str, Any], results: Sequence[SpecialistResult], ledger: dict[str, str]
 ) -> dict[str, Any]:
-    """Build the schema-shaped output. Only evidence_refs seen via MCP survive."""
+    """Build the schema-shaped output for the winning issue.
+
+    Only evidence_refs seen via MCP survive, and only the winning issue's details are kept.
+    """
+    case_id = case["case_id"]
     issue, status, confidence = decide(results)
+    rule = policy_rule_for(results, issue)
+    if rule and rule.get("case_status") in CASE_STATUSES:
+        status = rule["case_status"]
+    detail = _merged_details(results, issue)
 
     def real(refs: Sequence[str]) -> list[str]:
         return [ref for ref in _unique(list(refs)) if ref in ledger]
@@ -80,30 +180,32 @@ def assemble(
     for result in results:
         for claim in result.claims:
             claims.append({**claim, "evidence_refs": real(claim.get("evidence_refs", []))[:30]})
-    causes = [
-        c for c in _unique([c for r in results for c in r.root_causes]) if CAUSE_PATTERN.match(c)
-    ]
-    parties = _unique(
-        [
-            {"party_type": p["party_type"], "party_id": p.get("party_id")}
-            for r in results
-            for p in r.responsible_parties
-            if p.get("party_type") in PARTY_TYPES
-        ]
+    evidence = real(
+        [ref for r in results for ref in r.evidence_refs]
+        + [ref for c in claims for ref in c["evidence_refs"]]
+    )[:30]
+    if not evidence:
+        confidence = min(confidence, NO_EVIDENCE_CONFIDENCE_CAP)
+    claims += _claim_fallbacks(
+        case, issue, status, confidence, evidence, {c["claim_id"] for c in claims}
     )
+
+    causes = [c for c in _unique(detail.root_causes) if CAUSE_PATTERN.match(c)]
     refund_lines = [
         {
             "reason_code": str(line["reason_code"])[:80],
             "amount_brl": round(max(float(line["amount_brl"]), 0.0), 2),
             "entity_id": line.get("entity_id"),
         }
-        for r in results
-        for line in r.refund_lines
+        for line in detail.refund_lines
     ][:10]
-    evidence = real(
-        [ref for r in results for ref in r.evidence_refs]
-        + [ref for c in claims for ref in c["evidence_refs"]]
-    )[:30]
+    actions = [a[:80] for a in _unique(detail.actions) if a.strip()]
+    if rule:
+        if _number(rule.get("refund_brl")) == 0:
+            refund_lines = []  # nothing to refund per policy: keep refund aligned with status
+        action = rule.get("recommended_action")
+        if isinstance(action, str) and action.strip():
+            actions = [action.strip()[:80]]
 
     return {
         "schema_version": OUTPUT_SCHEMA_VERSION,
@@ -115,7 +217,7 @@ def assemble(
             "ranked_causes": [
                 {"cause_code": code, "rank": rank} for rank, code in enumerate(causes[:5], 1)
             ],
-            "responsible_parties": parties[:5],
+            "responsible_parties": _parties(detail.responsible_parties, rule)[:5],
         },
         "evidence_refs": evidence,
         "data_conflicts": _unique([c for r in results for c in r.conflicts])[:5],
@@ -124,9 +226,7 @@ def assemble(
             "recommended_refund_brl": round(sum(line["amount_brl"] for line in refund_lines), 2),
             "refund_lines": refund_lines,
         },
-        "resolution_actions": _unique([a[:80] for r in results for a in r.actions if a.strip()])[
-            :8
-        ],
+        "resolution_actions": actions[:8],
     }
 
 
@@ -222,12 +322,26 @@ async def run_case(
             },
         )
 
-    output = assemble(case_id, list(results.values()), ledger)
+    output = assemble(case, list(results.values()), ledger)
     try:
         trace.contracts.validate_output(output, f"outputs/{case_id}.json")
         fallback = False
     except ContractError:
         output, fallback = _safe_output(case_id, ledger), True
+
+    issue = output["assessment"]["primary_issue"]
+    if not fallback and policy_rule_for(list(results.values()), issue):
+        actions = output["resolution_actions"]
+        trace.emit(
+            case_id=case_id,
+            event_type="policy_decided",
+            actor="coordinator",
+            decision_code=issue,
+            attributes={
+                "case_status": output["assessment"]["case_status"],
+                "action": actions[0] if actions else None,
+            },
+        )
 
     trace.emit(
         case_id=case_id,

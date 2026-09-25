@@ -3,6 +3,9 @@
 Tools: get_order_payments, get_payment_timeline, get_refund_timeline.
 Nhận diện: valid_split_payment, payment_mismatch, duplicate_charge, refund_pending,
 refund_failed. Tính refund_lines (BRL, tổng phải khớp) và payment_references.
+
+Kết luận theo issue đặt trong `issue_details[issue] = IssueDetail(...)`: coordinator chỉ giữ
+phần của issue thắng. Vocabulary chuẩn: xem docstring của policy_verifier.py.
 """
 
 from __future__ import annotations
