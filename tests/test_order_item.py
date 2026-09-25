@@ -106,6 +106,23 @@ def test_order_item_missing_order_id(tmp_path: Path) -> None:
     assert res.notes.get("error") == "missing_order_id"
 
 
+def test_duplicate_item_row_is_not_counted_twice(tmp_path: Path) -> None:
+    agent = OrderItemAgent()
+    case = {"case_id": "CASE_DUP_ITEM", "customer_request": {"claimed_order_id": "ORD_001"}}
+    items = {
+        "evidence_ref": REF_ITEMS,
+        "data": [
+            {"order_item_id": "item_1", "price": "79", "freight_value": "10"},
+            {"order_item_id": "item_1", "price": "79", "freight_value": "25"},
+        ],
+    }
+    ctx = make_scoped_ctx(tmp_path, case, MockGateway({"get_order_items": items}), agent)
+    result = asyncio.run(agent.run(ctx))
+
+    assert result.notes["order_value"] == 89.0
+    assert result.notes["freight_total_brl"] == 10.0
+
+
 def test_order_item_canceled_order_flow(tmp_path: Path) -> None:
     agent = OrderItemAgent()
     case = {

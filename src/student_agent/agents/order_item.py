@@ -59,7 +59,7 @@ class OrderItemAgent:
         except ToolFailure as tf:
             return None, tf
         except Exception as exc:
-            return None, ToolFailure(tool_name, "unexpected_error", str(exc)[:120])
+            return None, ToolFailure(tool_name, "unexpected_error", type(exc).__name__)
 
     async def run(self, ctx: CaseContext) -> SpecialistResult:
         # 1. Trích xuất order_id từ ctx hoặc case
@@ -95,6 +95,7 @@ class OrderItemAgent:
                 notes={
                     "order_lookup_failed": True,
                     "error_kind": err_kind,
+                    "error_type": str(order_err)[:120] if order_err else "unknown",
                     "claimed_order_id": order_id,
                 },
                 root_causes=["INSUFFICIENT_ORDER_EVIDENCE"],
@@ -128,6 +129,7 @@ class OrderItemAgent:
         seller_ids: list[str] = []
         total_items_price = 0.0
         total_freight_value = 0.0
+        priced_item_ids: set[str] = set()
 
         for it in raw_items:
             if not isinstance(it, dict):
@@ -146,6 +148,13 @@ class OrderItemAgent:
             if "seller_id" in it and it["seller_id"]:
                 seller_ids.append(str(it["seller_id"]))
 
+            # MCP may return another row for the same order item with different
+            # values. Count a priced item once; keep the first observed row.
+            priced_id = str(it.get("order_item_id") or it.get("item_id") or "")
+            if priced_id and priced_id in priced_item_ids:
+                continue
+            if priced_id:
+                priced_item_ids.add(priced_id)
             with suppress(ValueError, TypeError):
                 total_items_price += float(it.get("price", 0.0))
             with suppress(ValueError, TypeError):
@@ -279,6 +288,8 @@ class OrderItemAgent:
             "items_count": len(raw_items),
             "items_total_brl": total_order_amount,
             "order_value": total_order_amount,
+            "freight_total_brl": round(total_freight_value, 2),
+            "order_purchase_at": str(order_data.get("order_purchase_timestamp") or ""),
             "has_items": bool(raw_items),
             "seller_count": len(seller_ids),
             "is_canceled": order_status == "canceled",

@@ -11,9 +11,22 @@ phần của issue thắng. Vocabulary chuẩn: xem docstring của policy_verif
 from __future__ import annotations
 
 from contextlib import suppress
+from datetime import datetime
 from typing import Any
 
 from .contract import CaseContext, IssueDetail, SpecialistResult, ToolFailure
+
+
+def _within_window(event_at: Any, start: Any, end: Any) -> bool:
+    if not event_at:
+        return False
+    try:
+        event = datetime.fromisoformat(str(event_at).replace("Z", "+00:00"))
+        if start and event < datetime.fromisoformat(str(start).replace("Z", "+00:00")):
+            return False
+        return not end or event <= datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
 
 
 class PaymentRefundAgent:
@@ -79,7 +92,6 @@ class PaymentRefundAgent:
                     p.get("payment_reference")
                     or p.get("payment_id")
                     or p.get("reference")
-                    or p.get("payment_sequential")
                 )
                 if ref is not None:
                     payment_refs.append(str(ref))
@@ -90,9 +102,26 @@ class PaymentRefundAgent:
         # Bổ sung từ timeline nếu có
         if not isinstance(payment_timeline_data, dict):
             payment_timeline_data = {}
-        for event in payment_timeline_data.get("events", []):
-            if isinstance(event, dict) and event.get("payment_reference"):
-                payment_refs.append(str(event["payment_reference"]))
+        events = payment_timeline_data.get("events", [])
+        payment_count = len(payment_list)
+        if isinstance(events, list) and events:
+            purchase_at = prior_order.notes.get("order_purchase_at") if prior_order else None
+            opened_at = ctx.case.get("opened_at")
+            captures = [
+                event
+                for event in events
+                if isinstance(event, dict)
+                and event.get("event_type") == "captured"
+                and event.get("status") == "confirmed"
+                and _within_window(event.get("event_at"), purchase_at, opened_at)
+            ]
+            payment_count = len(captures)
+            total_paid = 0.0
+            for event in captures:
+                with suppress(TypeError, ValueError):
+                    total_paid += float(event.get("amount_brl") or 0)
+                if event.get("payment_reference"):
+                    payment_refs.append(str(event["payment_reference"]))
 
         if payment_refs:
             result.entities["payment_references"] = sorted(set(payment_refs))
@@ -115,7 +144,7 @@ class PaymentRefundAgent:
         is_duplicate = False
         duplicate_amount = 0.0
         if (
-            len(payment_list) > 1
+            payment_count > 1
             and order_val_float is not None
             and round(total_paid, 2) > round(order_val_float, 2)
         ):
@@ -125,8 +154,25 @@ class PaymentRefundAgent:
         # Kiểm tra qua refund timeline
         if not isinstance(refund_timeline_data, dict):
             refund_timeline_data = {}
+        refund_events = refund_timeline_data.get("events", [])
+        refund_event: dict[str, Any] = {}
+        if isinstance(refund_events, list):
+            eligible = [
+                event
+                for event in refund_events
+                if isinstance(event, dict)
+                and event.get("event_type") == "refund_requested"
+                and _within_window(
+                    event.get("event_at"),
+                    prior_order.notes.get("order_purchase_at") if prior_order else None,
+                    ctx.case.get("opened_at"),
+                )
+            ]
+            if eligible:
+                refund_event = max(eligible, key=lambda event: str(event.get("event_at", "")))
         refund_status = (
-            refund_timeline_data.get("status")
+            refund_event.get("status")
+            or refund_timeline_data.get("status")
             or refund_timeline_data.get("refund_status")
             or ""
         ).lower()
@@ -145,7 +191,9 @@ class PaymentRefundAgent:
             rc = ["REFUND_PROCESSING_FAILED"]
             resp = [provider]
             acts = ["retry_refund"]
-            refund_amount = refund_timeline_data.get("refund_amount")
+            refund_amount = refund_event.get("amount_brl")
+            if refund_amount is None:
+                refund_amount = refund_timeline_data.get("refund_amount")
             if refund_amount is None:
                 refund_amount = refund_timeline_data.get("amount_brl")
             try:
@@ -204,7 +252,7 @@ class PaymentRefundAgent:
                 actions=acts,
             )
         elif (
-            len(payment_list) > 1
+            payment_count > 1
             and order_val_float is not None
             and abs(total_paid - order_val_float) < 0.05
         ):
@@ -224,7 +272,7 @@ class PaymentRefundAgent:
             )
         elif (
             payments_loaded
-            and payment_list
+            and payment_count > 0
             and order_val_float is not None
             and abs(total_paid - order_val_float) >= 0.05
         ):

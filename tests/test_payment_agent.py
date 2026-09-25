@@ -178,3 +178,95 @@ def test_missing_payment_evidence_does_not_become_payment_mismatch(tmp_path: Pat
     )
     result = asyncio.run(PaymentRefundAgent().run(ctx))
     assert "payment_mismatch" not in result.issue_signals
+
+
+def test_timeline_uses_captures_within_case_window(tmp_path: Path) -> None:
+    case = {
+        "case_id": "CASE_SPLIT",
+        "opened_at": "2018-05-05T09:00:00-03:00",
+        "customer_request": {"claimed_order_id": "ord_1"},
+    }
+    responses = {
+        "get_order_payments": {
+            "evidence_ref": "ev_" + "1" * 24,
+            "data": [
+                {"payment_value": "44.50"},
+                {"payment_value": "44.50"},
+                {"payment_value": "52.00"},
+            ],
+        },
+        "get_payment_timeline": {
+            "evidence_ref": "ev_" + "2" * 24,
+            "data": {
+                "events": [
+                    {
+                        "event_at": "2018-04-23T10:00:00-03:00",
+                        "event_type": "captured",
+                        "status": "confirmed",
+                        "amount_brl": "44.50",
+                    },
+                    {
+                        "event_at": "2018-04-23T11:00:00-03:00",
+                        "event_type": "captured",
+                        "status": "confirmed",
+                        "amount_brl": "44.50",
+                    },
+                    {
+                        "event_at": "2018-01-07T10:00:00-03:00",
+                        "event_type": "captured",
+                        "status": "confirmed",
+                        "amount_brl": "52.00",
+                    },
+                ]
+            },
+        },
+        "get_refund_timeline": {
+            "evidence_ref": "ev_" + "3" * 24,
+            "data": {
+                "events": [
+                    {
+                        "event_at": "2018-01-07T10:00:00-03:00",
+                        "event_type": "refund_requested",
+                        "status": "failed",
+                    }
+                ]
+            },
+        },
+    }
+    ctx = make_context(tmp_path, case, responses)
+    ctx.prior["order-agent"] = SpecialistResult(
+        agent="order-agent",
+        entities={"order_ids": ["ord_1"]},
+        notes={"order_value": 89.0, "order_purchase_at": "2018-04-23T09:00:00-03:00"},
+    )
+    result = asyncio.run(PaymentRefundAgent().run(ctx))
+
+    assert result.strongest_issue() == "valid_split_payment"
+    assert result.notes["total_paid"] == 89.0
+
+
+def test_refund_status_comes_from_timeline_event(tmp_path: Path) -> None:
+    case = {
+        "case_id": "CASE_REFUND_EVENT",
+        "opened_at": "2018-09-09T09:00:00-03:00",
+        "customer_request": {"claimed_order_id": "ord_1"},
+    }
+    responses = {
+        "get_refund_timeline": {
+            "evidence_ref": "ev_" + "3" * 24,
+            "data": {
+                "events": [
+                    {
+                        "event_at": "2018-09-08T09:00:00-03:00",
+                        "event_type": "refund_requested",
+                        "status": "failed",
+                        "amount_brl": "52.00",
+                    }
+                ]
+            },
+        }
+    }
+    result = asyncio.run(PaymentRefundAgent().run(make_context(tmp_path, case, responses)))
+
+    assert result.strongest_issue() == "refund_failed"
+    assert result.details_for("refund_failed").refund_lines[0]["amount_brl"] == 52.0

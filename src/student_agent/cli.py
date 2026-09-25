@@ -46,24 +46,31 @@ async def _run(root: Path) -> None:
             raise RuntimeError("MCP Gateway returned no tools")
         total_cases = len(case_set.case_ids)
         print(f"=== Bắt đầu điều tra {total_cases} cases qua MCP Gateway ===", flush=True)
-        for idx, case_id in enumerate(case_set.case_ids, 1):
-            print(f"[{idx:3d}/{total_cases}] Đang xử lý {case_id}...", end=" ", flush=True)
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
-            issue = output["assessment"]["primary_issue"]
-            conf = output["assessment"]["confidence"]
-            print(f"OK -> {issue} (conf: {conf:.2f})", flush=True)
+        limit = asyncio.Semaphore(8)
+
+        async def process(idx: int, case_id: str) -> None:
+            async with limit:
+                print(f"[{idx:3d}/{total_cases}] Đang xử lý {case_id}...", flush=True)
+                case = case_set.cases[case_id]
+                trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                output = await solve_case(case, gateway, trace)
+                contracts.validate_output(output, f"outputs/{case_id}.json")
+                if output.get("case_id") != case_id:
+                    raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                target = output_root / f"{case_id}.json"
+                temporary = target.with_suffix(".json.tmp")
+                temporary.write_text(
+                    json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                temporary.replace(target)
+                trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                issue = output["assessment"]["primary_issue"]
+                conf = output["assessment"]["confidence"]
+                print(f"[{idx:3d}/{total_cases}] {case_id}: {issue} ({conf:.2f})", flush=True)
+
+        await asyncio.gather(
+            *(process(idx, case_id) for idx, case_id in enumerate(case_set.case_ids, 1))
+        )
         print(f"=== Hoàn thành toàn bộ {total_cases}/{total_cases} cases! ===", flush=True)
 
 
@@ -81,6 +88,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Windows terminals launched without a UTF-8 code page may default to cp1252.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     args = parser().parse_args()
     root = _root(args.root)
     try:

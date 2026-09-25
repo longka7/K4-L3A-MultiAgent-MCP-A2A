@@ -73,6 +73,7 @@ Trước khi xuất file output, `Verifier Agent` kiểm tra và chuẩn hóa c�
 - **Dependencies:** `httpx2>=2,<3`, `jsonschema[format]>=4.25,<5`, `mcp>=2,<3`, `python-dotenv>=1.1,<2`.
 - **Cơ chế ra quyết định:** Deterministic rule-based, đảm bảo kết quả 100% tái lập, thời gian thực thi nhanh và không phụ thuộc chi phí/độ trễ của API bên thứ ba.
 - **A2A và retry:** Mỗi agent chạy một lần theo thứ tự; MCP timeout 30 giây, thử lại tối đa 2 lần với chờ 0.5 và 1 giây cho lỗi tạm thời. Issue hòa điểm được phá theo thứ tự `ISSUE_CODES`.
+- **Song song giữa các case:** CLI xử lý tối đa 8 case đồng thời; ledger, cache và kết quả của mỗi case độc lập. Trong từng case, các agent vẫn chạy tuần tự để dùng `ctx.prior`.
 - **Lệnh thực thi:**
   - Chạy toàn bộ 100 cases: `day09 run`
   - Kiểm tra tính hợp lệ: `day09 validate`

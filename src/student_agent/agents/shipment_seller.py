@@ -86,6 +86,14 @@ class ShipmentSellerAgent:
             for shipment in shipments
             if shipment.get("seller_id") is not None
         )
+        for shipment in shipments:
+            limits = shipment.get("shipping_limits")
+            if isinstance(limits, list):
+                seller_ids.extend(
+                    str(limit["seller_id"])
+                    for limit in limits
+                    if isinstance(limit, dict) and limit.get("seller_id") is not None
+                )
 
         if not seller_ids:
             try:
@@ -109,20 +117,35 @@ class ShipmentSellerAgent:
             limit_date = _first(
                 shipment, "shipping_limit_date", "seller_shipping_limit_date", "limit_date"
             )
+            limits = shipment.get("shipping_limits")
+            if limit_date is None and isinstance(limits, list):
+                distinct_limits = {
+                    limit.get("shipping_limit_at")
+                    for limit in limits
+                    if isinstance(limit, dict) and limit.get("shipping_limit_at")
+                }
+                if len(distinct_limits) == 1:
+                    limit_date = next(iter(distinct_limits))
             pickup_date = _first(
-                shipment, "carrier_pickup_date", "order_delivered_carrier_date", "pickup_date"
+                shipment,
+                "carrier_pickup_date",
+                "order_delivered_carrier_date",
+                "delivered_carrier_at",
+                "pickup_date",
             )
             delivered_date = _first(
                 shipment,
                 "delivered_customer_date",
                 "order_delivered_customer_date",
                 "actual_delivery_date",
+                "delivered_customer_at",
                 "delivered_date",
             )
             estimated_date = _first(
                 shipment,
                 "estimated_delivery_date",
                 "order_estimated_delivery_date",
+                "estimated_delivery_at",
                 "estimated_date",
             )
             attribution = " ".join(
@@ -139,6 +162,17 @@ class ShipmentSellerAgent:
             explicit_logistics = shipment.get("logistics_at_fault") is True or any(
                 term in attribution for term in ("logistics", "carrier", "shipping_provider")
             )
+            events = shipment.get("events")
+            if isinstance(events, list):
+                late_actors = {
+                    str(event.get("actor"))
+                    for event in events
+                    if isinstance(event, dict)
+                    and event.get("event_type") == "delivered_late"
+                    and event.get("status") == "confirmed"
+                }
+                explicit_seller |= "seller" in late_actors
+                explicit_logistics |= "logistics_provider" in late_actors
             logistics_timeline = delivery_late and (
                 shipment.get("handoff_late") is False
                 or (pickup_date and limit_date and not handoff_late)
@@ -166,8 +200,11 @@ class ShipmentSellerAgent:
             result.issue_signals[issue] = max(
                 result.issue_signals.get(issue, 0.0), 0.9 if explicit else 0.85
             )
+            freight_source = shipment.get("freight_value")
+            if freight_source is None and prior_order:
+                freight_source = prior_order.notes.get("freight_total_brl")
             try:
-                freight = float(shipment.get("freight_value") or 0)
+                freight = float(freight_source or 0)
             except (TypeError, ValueError):
                 freight = 0.0
             refund_lines = []

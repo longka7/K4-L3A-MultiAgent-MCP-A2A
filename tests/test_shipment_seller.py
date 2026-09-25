@@ -93,3 +93,32 @@ def test_late_seller_handoff_uses_evidence_freight_and_prior_seller(tmp_path: Pa
         {"reason_code": "SELLER_LATE_DELIVERY", "amount_brl": 12.5, "entity_id": "order_1"}
     ]
     assert [name for name, _ in gateway.calls] == ["get_shipment_summary"]
+
+
+def test_summary_event_actor_resolves_conflicting_shipping_limits(tmp_path: Path) -> None:
+    prior = SpecialistResult(
+        agent="order-agent",
+        entities={"seller_ids": ["seller_3"]},
+        notes={"freight_total_brl": 18.0},
+    )
+    ctx, gateway = make_context(
+        tmp_path,
+        {
+            "delivered_carrier_at": "2018-02-26T09:00:00-03:00",
+            "delivered_customer_at": "2018-03-05T09:00:00-03:00",
+            "estimated_delivery_at": "2018-03-01T09:00:00-03:00",
+            "shipping_limits": [
+                {"seller_id": "seller_3", "shipping_limit_at": "2018-02-22T09:00:00-03:00"},
+                {"seller_id": "seller_3", "shipping_limit_at": "2018-03-12T09:00:00-03:00"},
+            ],
+            "events": [
+                {"event_type": "delivered_late", "actor": "seller", "status": "confirmed"}
+            ],
+        },
+        prior,
+    )
+    result = asyncio.run(ShipmentSellerAgent().run(ctx))
+
+    assert result.strongest_issue() == "late_delivery_seller"
+    assert result.details_for("late_delivery_seller").refund_lines[0]["amount_brl"] == 18.0
+    assert [name for name, _ in gateway.calls] == ["get_shipment_summary"]
