@@ -26,7 +26,7 @@ Mọi lời gọi MCP đi qua `ScopedGateway`, mọi sự kiện đi qua `TraceW
 | --- | --- | --- | --- |
 | Coordinator | `case` (case_id, customer_request, policy_version), kết quả các specialist | Giao việc, chọn `primary_issue`, áp policy, ghép output đúng schema, phát trace vòng đời; không gọi tool MCP nào | `outputs/<case_id>.json`, trace, handoff sang verifier |
 | Order/item | TODO | TODO | TODO |
-| Payment | TODO | TODO | TODO |
+| Payment | `ctx.claimed_order_id`, `ctx.prior["order-item-agent"]` | Gọi MCP `get_order_payments`, `get_payment_timeline`, `get_refund_timeline`; phát hiện trùng lặp giao dịch, lệch tiền, split payment, hoàn tiền thất bại/treo; trích xuất `payment_references` và tính toán `refund_lines` (BRL). | `SpecialistResult` chứa `payment_references`, `issue_signals`, `refund_lines`, `evidence_refs`, `root_causes`, `responsible_parties`. |
 | Shipment | TODO | TODO | TODO |
 | Policy | TODO | TODO | TODO |
 | Verifier | TODO | TODO | TODO |
