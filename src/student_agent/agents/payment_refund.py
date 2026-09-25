@@ -56,9 +56,13 @@ class PaymentRefundAgent:
             pass
 
         # Trích xuất payment_references và thông tin thanh toán
-        payment_list = payments_data.get("payments", [])
+        payment_list: list[Any] = []
         if isinstance(payments_data, list):
             payment_list = payments_data
+        elif isinstance(payments_data, dict):
+            payment_list = payments_data.get("payments", [])
+            if not isinstance(payment_list, list):
+                payment_list = []
 
         payment_refs: list[str] = []
         total_paid = 0.0
@@ -89,7 +93,9 @@ class PaymentRefundAgent:
 
         # Phân tích các issue nghiệp vụ thanh toán
         # Lấy giá trị đơn hàng thực tế
-        order_value = payments_data.get("order_value") or payments_data.get("expected_amount")
+        order_value = None
+        if isinstance(payments_data, dict):
+            order_value = payments_data.get("order_value") or payments_data.get("expected_amount")
         if order_value is None and prior_order:
             order_value = prior_order.notes.get("order_value")
 

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from student_agent.agents.contract import CaseContext, ScopedGateway, SpecialistResult
+from student_agent.agents.contract import CaseContext, ScopedGateway
 from student_agent.agents.payment_refund import PaymentRefundAgent
 from student_agent.contracts import Contracts
 from student_agent.trace import TraceWriter
@@ -97,3 +97,74 @@ def test_payment_agent_duplicate_charge(tmp_path: Path) -> None:
     assert "pay_ref_001" in result.entities.get("payment_references", [])
     assert "pay_ref_002" in result.entities.get("payment_references", [])
     assert any(line["amount_brl"] == 150.0 for line in result.refund_lines)
+
+
+def test_payment_agent_valid_split_payment(tmp_path: Path) -> None:
+    case = {
+        "case_id": "L3A_CASE_005",
+        "customer_request": {
+            "claimed_order_id": "ord_split",
+            "claims": [{"claim_id": "c2", "topic": "valid_split_payment"}],
+        },
+    }
+    payments_resp = {
+        "schema_version": "day09-mcp-evidence-v1",
+        "evidence_ref": "ev_pay_ref_" + "2" * 20,
+        "result_hash": "sha256:" + "0" * 64,
+        "domain": "payment",
+        "data": {
+            "payments": [
+                {
+                    "payment_sequential": 1,
+                    "payment_type": "voucher",
+                    "payment_installments": 1,
+                    "payment_value": 50.0,
+                    "payment_reference": "pay_voucher_01",
+                },
+                {
+                    "payment_sequential": 2,
+                    "payment_type": "credit_card",
+                    "payment_installments": 1,
+                    "payment_value": 100.0,
+                    "payment_reference": "pay_card_01",
+                },
+            ],
+            "order_value": 150.0,
+        },
+    }
+
+    ctx = make_context(tmp_path, case, {"get_order_payments": payments_resp})
+    agent = PaymentRefundAgent()
+    result = asyncio.run(agent.run(ctx))
+
+    assert "valid_split_payment" in result.issue_signals
+    assert result.issue_signals["valid_split_payment"] > 0.5
+    assert len(result.refund_lines) == 0
+
+
+def test_payment_agent_refund_failed(tmp_path: Path) -> None:
+    case = {
+        "case_id": "L3A_CASE_009",
+        "customer_request": {
+            "claimed_order_id": "ord_ref_fail",
+            "claims": [{"claim_id": "c3", "topic": "refund_failed"}],
+        },
+    }
+    refund_resp = {
+        "schema_version": "day09-mcp-evidence-v1",
+        "evidence_ref": "ev_ref_fail_" + "3" * 20,
+        "result_hash": "sha256:" + "0" * 64,
+        "domain": "refund",
+        "data": {
+            "status": "failed",
+            "failure_reason": "GATEWAY_TIMEOUT",
+        },
+    }
+
+    ctx = make_context(tmp_path, case, {"get_refund_timeline": refund_resp})
+    agent = PaymentRefundAgent()
+    result = asyncio.run(agent.run(ctx))
+
+    assert "refund_failed" in result.issue_signals
+    assert result.issue_signals["refund_failed"] > 0.8
+    assert "retry_refund" in result.actions
